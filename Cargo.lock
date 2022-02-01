@@ -381,12 +381,12 @@ dependencies = [
 
 [[package]]
 name = "iptables"
-version = "0.4.3"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5451d970ceaf1d94b287f060eda6c553b0bd93412986765e3274c28a89b50830"
+checksum = "1c488ad8e743814579544d5a17bda107cd7a4009ade4d55ce94f4c3ec0281147"
 dependencies = [
  "lazy_static",
- "nix",
+ "nix 0.23.1",
  "regex",
 ]
 
@@ -473,6 +473,19 @@ name = "nix"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5e06129fb611568ef4e868c14b326274959aa70ff7776e9d55323531c374945"
+dependencies = [
+ "bitflags",
+ "cc",
+ "cfg-if",
+ "libc",
+ "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f866317acbd3a240710c63f065ffb1e4fd466259045ccb504130b7f668f35c6"
 dependencies = [
  "bitflags",
  "cc",
@@ -953,7 +966,7 @@ dependencies = [
  "fastrand",
  "futures",
  "nb-connect",
- "nix",
+ "nix 0.20.2",
  "once_cell",
  "polling",
  "scoped-tls",
