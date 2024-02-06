@@ -47,7 +47,7 @@ nix = { version = "0.27.1", features = ["sched", "signal", "user"] }
 rand = "0.8.5"
 sha2 = "0.10.8"
 netlink-packet-utils = "0.5.2"
-netlink-packet-route = "0.18.1"
+netlink-packet-route = "0.19.0"
 netlink-packet-core = "0.7.0"
 nftables = "0.3"
 fs2 = "0.4.3"
@@ -60,7 +60,6 @@ prost = "0.12"
 futures-channel="0.3.30"
 futures-core = "0.3.30"
 futures-util = "0.3.30"
-nispor = "1.2.16"
 tower = { version = "0.4" }
 
 [build-dependencies]
