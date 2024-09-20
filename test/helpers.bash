@@ -660,11 +660,13 @@ function run_nc_test() {
     data=$(random_string)
     run_in_host_netns nc $nc_common_args $connect_ip $host_port <<<"$data"
 
-    got=$(cat "$NETAVARK_TMPDIR/nc-out")
-    assert "$got" == "$data" "ncat received data"
-
     # close the fd
     exec {stdin}>&-
+    # wait for the background process to finish
+    wait
+
+    got=$(cat "$NETAVARK_TMPDIR/nc-out")
+    assert "$got" == "$data" "ncat received data"
 }
 
 #################
