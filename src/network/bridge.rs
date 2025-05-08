@@ -165,28 +165,14 @@ impl driver::NetworkDriver for Bridge<'_> {
 
         let (host_sock, netns_sock) = netlink_sockets;
 
-        // Create sysctl writer, when using systemd and running as root it is possible that the
-        // global configured sysctl.d config conflict with the values we write. In such cases
-        // systemd-sysctl might overright the value causing hard to find errors:
-        // https://issues.redhat.com/browse/RHEL-89477
-        // This writer is used to generate a matching sysctl.d config file for our values so systemd is aware of them.
-        let mut sysctl_writer = if is_using_systemd() && !self.info.rootless {
-            let _ = fs::create_dir("/run/sysctl.d");
-            sysctl::SysctlDWriter::new(sysctl::get_bridge_sysctl_d_path(
-                &data.bridge_interface_name,
-            ))
-        } else {
-            None
-        };
-
-        let container_veth_mac = create_interfaces(
+        let (container_veth_mac, sysctl_writer) = create_interfaces(
             host_sock,
             netns_sock,
             data,
             self.info.network.internal,
+            self.info.rootless,
             self.info.netns_host,
             self.info.netns_container,
-            &mut sysctl_writer,
         )?;
 
         //  StatusBlock response
@@ -298,14 +284,6 @@ impl driver::NetworkDriver for Bridge<'_> {
         if let BridgeMode::Managed = data.mode {
             // if the network is internal do not setup firewall rules
             if !self.info.network.internal {
-                sysctl::apply_sysctl_value_with_writer(
-                    format!(
-                        "net/ipv4/conf/{}/route_localnet",
-                        data.bridge_interface_name
-                    ),
-                    "1",
-                    &mut sysctl_writer,
-                )?;
                 self.setup_firewall(data)?
             }
         }
@@ -566,10 +544,14 @@ fn create_interfaces(
     netns: &mut netlink::Socket,
     data: &InternalData,
     internal: bool,
+    rootless: bool,
     hostns_fd: BorrowedFd<'_>,
     netns_fd: BorrowedFd<'_>,
-    sysctl_writer: &mut Option<sysctl::SysctlDWriter<String>>,
-) -> NetavarkResult<String> {
+) -> NetavarkResult<(
+    String,
+    Option<sysctl::SysctlDWriter<'static, String, String>>,
+)> {
+    let mut sysctl_writer = None;
     let (bridge_index, mac) = match host.get_link(netlink::LinkID::Name(
         data.bridge_interface_name.to_string(),
     )) {
@@ -595,6 +577,72 @@ fn create_interfaces(
                         .wrap("in unmanaged mode, the bridge must already exist on the host");
                 }
 
+                // Create sysctl writer, when using systemd and running as root it is possible that the
+                // global configured sysctl.d config conflict with the values we write. In such cases
+                // systemd-sysctl might overright the value causing hard to find errors:
+                // https://issues.redhat.com/browse/RHEL-89477
+                // This writer is used to generate a matching sysctl.d config file for our values so
+                // systemd-sysctl is aware of them.
+                let path = if is_using_systemd() && !rootless {
+                    let _ = fs::create_dir("/run/sysctl.d");
+                    Some(sysctl::get_bridge_sysctl_d_path(
+                        &data.bridge_interface_name,
+                    ))
+                } else {
+                    None
+                };
+
+                let mut sysctls = Vec::with_capacity(6);
+
+                // if internal block routing on the bridge otherwise enable routing globally
+                if internal {
+                    sysctls.push((
+                        format!("net/ipv4/conf/{}/forwarding", data.bridge_interface_name),
+                        "0",
+                    ));
+                    if data.ipam.ipv6_enabled {
+                        sysctls.push((
+                            format!("net/ipv6/conf/{}/forwarding", data.bridge_interface_name),
+                            "0",
+                        ));
+                    }
+                } else {
+                    sysctls.push((IPV4_FORWARD.to_string(), "1"));
+                    if data.ipam.ipv6_enabled {
+                        sysctls.push((IPV6_FORWARD.to_string(), "1"));
+                    }
+                    sysctls.push((
+                        format!(
+                            "net/ipv4/conf/{}/route_localnet",
+                            data.bridge_interface_name
+                        ),
+                        "1",
+                    ));
+                }
+
+                if data.ipam.ipv6_enabled {
+                    // Disable duplicate address detection if ipv6 enabled
+                    // Do not accept Router Advertisements if ipv6 is enabled
+                    let br_accept_dad =
+                        format!("net/ipv6/conf/{}/accept_dad", &data.bridge_interface_name);
+                    let br_accept_ra =
+                        format!("net/ipv6/conf/{}/accept_ra", &data.bridge_interface_name);
+                    sysctls.push((br_accept_dad, "0"));
+                    sysctls.push((br_accept_ra, "0"));
+                }
+
+                // Disable strict reverse path search validation. On RHEL it is set to strict mode
+                // which breaks port forwarding when multiple networks are attached as the package
+                // may be routed over a different interface on the reverse path.
+                // As documented for the sysctl for complicated or asymmetric routing loose mode (2)
+                // is recommended.
+                let br_rp_filter =
+                    format!("net/ipv4/conf/{}/rp_filter", &data.bridge_interface_name);
+                sysctls.push((br_rp_filter, "2"));
+
+                // writer must be create before the bridge is created
+                let sw = sysctl::SysctlDWriter::new(path, sysctls);
+
                 let mut create_link_opts = netlink::CreateLinkOptions::new(
                     data.bridge_interface_name.to_string(),
                     InfoKind::Bridge,
@@ -616,45 +664,9 @@ fn create_interfaces(
 
                 host.create_link(create_link_opts).wrap("create bridge")?;
 
-                // if internal block routing on the bridge otherwise enable routing globally
-                if internal {
-                    sysctl::apply_sysctl_value_with_writer(
-                        format!("net/ipv4/conf/{}/forwarding", data.bridge_interface_name),
-                        "0",
-                        sysctl_writer,
-                    )?;
-                } else {
-                    sysctl::apply_sysctl_value_with_writer(IPV4_FORWARD, "1", sysctl_writer)?;
-                }
-
-                if data.ipam.ipv6_enabled {
-                    if internal {
-                        sysctl::apply_sysctl_value_with_writer(
-                            format!("net/ipv6/conf/{}/forwarding", data.bridge_interface_name),
-                            "0",
-                            sysctl_writer,
-                        )?;
-                    } else {
-                        sysctl::apply_sysctl_value_with_writer(IPV6_FORWARD, "1", sysctl_writer)?;
-                    }
-                    // Disable duplicate address detection if ipv6 enabled
-                    // Do not accept Router Advertisements if ipv6 is enabled
-                    let br_accept_dad =
-                        format!("net/ipv6/conf/{}/accept_dad", &data.bridge_interface_name);
-                    let br_accept_ra =
-                        format!("net/ipv6/conf/{}/accept_ra", &data.bridge_interface_name);
-                    sysctl::apply_sysctl_value_with_writer(br_accept_dad, "0", sysctl_writer)?;
-                    sysctl::apply_sysctl_value_with_writer(br_accept_ra, "0", sysctl_writer)?;
-                }
-
-                // Disable strict reverse path search validation. On RHEL it is set to strict mode
-                // which breaks port forwarding when multiple networks are attached as the package
-                // may be routed over a different interface on the reverse path.
-                // As documented for the sysctl for complicated or asymmetric routing loose mode (2)
-                // is recommended.
-                let br_rp_filter =
-                    format!("net/ipv4/conf/{}/rp_filter", &data.bridge_interface_name);
-                sysctl::apply_sysctl_value_with_writer(br_rp_filter, "2", sysctl_writer)?;
+                // Note sysctls must be written after the bridge is created
+                sw.write_sysctls()?;
+                sysctl_writer = Some(sw);
 
                 let link = host
                     .get_link(netlink::LinkID::Name(
@@ -688,7 +700,7 @@ fn create_interfaces(
         },
     };
 
-    create_veth_pair(
+    let mac = create_veth_pair(
         host,
         netns,
         data,
@@ -697,7 +709,8 @@ fn create_interfaces(
         internal,
         hostns_fd,
         netns_fd,
-    )
+    )?;
+    Ok((mac, sysctl_writer))
 }
 
 /// return the container veth mac address
